@@ -1,0 +1,741 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        build_type: [Debug, Release]
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+          - os: macos-latest
+            compiler: clang
+    
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+    
+    - name: Install dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential libprotobuf-dev protobuf-compiler
+        sudo apt-get install -y clang-format clang-tidy valgrind
+    
+    - name: Install dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install cmake protobuf
+        brew install clang-format
+    
+    - name: Configure CMake
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+              -DENABLE_TESTING=ON -DENABLE_BENCHMARKS=ON
+    
+    - name: Build
+      run: cmake --build build --config ${{ matrix.build_type }} -j4
+    
+    - name: Run tests
+      run: |
+        cd build
+        ctest --output-on-failure -C ${{ matrix.build_type }}
+    
+    - name: Run benchmarks
+      if: matrix.build_type == 'Release'
+      run: |
+        cd build
+        ./benchmarks/compilation_speed/benchmark_compile_time
+        ./benchmarks/runtime_performance/benchmark_inference
+
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-format clang-tidy
+    
+    - name: Check code formatting
+      run: |
+        find include src examples tests -name "*.h" -o -name "*.cpp" | \
+        xargs clang-format -style=Google --dry-run --Werror
+    
+    - name: Run static analysis
+      run: |
+        cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+        clang-tidy src/**/*.cpp -p build
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential libprotobuf-dev gcov lcov
+    
+    - name: Configure with coverage
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=Debug \
+              -DENABLE_TESTING=ON -DCMAKE_CXX_FLAGS="--coverage"
+    
+    - name: Build and test
+      run: |
+        cmake --build build -j4
+        cd build && ctest
+    
+    - name: Generate coverage report
+      run: |
+        lcov --capture --directory build --output-file coverage.info
+        lcov --remove coverage.info '/usr/*' --output-file coverage.info
+        lcov --list coverage.info
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: coverage.info
+
+---
+
+# ============================================================================
+# File: tests/unit/test_fusion_pass.cpp
+# ============================================================================
+#include <gtest/gtest.h>
+#include "neuralcompiler/optimization/fusion_pass.h"
+#include "neuralcompiler/core/graph.h"
+#include "neuralcompiler/core/node.h"
+
+using namespace neuralcompiler;
+
+class FusionPassTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        fusion_pass_ = std::make_unique<FusionPass>();
+    }
+    
+    Graph createConvBnReluGraph() {
+        Graph graph;
+        
+        // Create Conv2D node
+        Node conv_node(NodeType::CONV2D, "conv");
+        conv_node.setAttribute("kernel_size", std::vector<int>{3, 3});
+        conv_node.setAttribute("stride", std::vector<int>{1, 1});
+        conv_node.setInputs({"input"});
+        conv_node.setOutputs({"conv_out"});
+        
+        // Create BatchNorm node
+        Node bn_node(NodeType::BATCH_NORM, "bn");
+        bn_node.setAttribute("epsilon", 1e-5f);
+        bn_node.setInputs({"conv_out"});
+        bn_node.setOutputs({"bn_out"});
+        
+        // Create ReLU node
+        Node relu_node(NodeType::RELU, "relu");
+        relu_node.setInputs({"bn_out"});
+        relu_node.setOutputs({"output"});
+        
+        graph.addNode(conv_node);
+        graph.addNode(bn_node);
+        graph.addNode(relu_node);
+        
+        return graph;
+    }
+    
+    Graph createAttentionGraph() {
+        Graph graph;
+        
+        // Simplified attention pattern: Q*K -> Add -> Softmax -> *V
+        Node qk_matmul(NodeType::MATMUL, "qk_matmul");
+        qk_matmul.setInputs({"Q", "K"});
+        qk_matmul.setOutputs({"qk_out"});
+        
+        Node add_bias(NodeType::ADD, "add_bias");
+        add_bias.setInputs({"qk_out", "bias"});
+        add_bias.setOutputs({"add_out"});
+        
+        Node softmax(NodeType::SOFTMAX, "softmax");
+        softmax.setInputs({"add_out"});
+        softmax.setOutputs({"attn_weights"});
+        
+        Node attn_matmul(NodeType::MATMUL, "attn_matmul");
+        attn_matmul.setInputs({"attn_weights", "V"});
+        attn_matmul.setOutputs({"output"});
+        
+        graph.addNode(qk_matmul);
+        graph.addNode(add_bias);
+        graph.addNode(softmax);
+        graph.addNode(attn_matmul);
+        
+        return graph;
+    }
+    
+    std::unique_ptr<FusionPass> fusion_pass_;
+};
+
+TEST_F(FusionPassTest, ConvBnReluFusion) {
+    auto graph = createConvBnReluGraph();
+    EXPECT_EQ(graph.getNodeCount(), 3);
+    
+    bool modified = fusion_pass_->fuseConvBatchNormReLU(graph);
+    
+    EXPECT_TRUE(modified);
+    EXPECT_EQ(graph.getNodeCount(), 1);
+    
+    const auto& nodes = graph.getNodes();
+    EXPECT_EQ(nodes[0].getType(), NodeType::FUSED_CONV_BN_RELU);
+    EXPECT_EQ(nodes[0].getInputs().size(), 1);
+    EXPECT_EQ(nodes[0].getOutputs().size(), 1);
+    EXPECT_EQ(nodes[0].getInputs()[0], "input");
+    EXPECT_EQ(nodes[0].getOutputs()[0], "output");
+}
+
+TEST_F(FusionPassTest, AttentionFusion) {
+    auto graph = createAttentionGraph();
+    EXPECT_EQ(graph.getNodeCount(), 4);
+    
+    bool modified = fusion_pass_->fuseMultiHeadAttention(graph);
+    
+    EXPECT_TRUE(modified);
+    EXPECT_EQ(graph.getNodeCount(), 1);
+    
+    const auto& nodes = graph.getNodes();
+    EXPECT_EQ(nodes[0].getType(), NodeType::FUSED_ATTENTION);
+    EXPECT_TRUE(nodes[0].hasAttribute("num_heads"));
+    EXPECT_TRUE(nodes[0].hasAttribute("head_dim"));
+}
+
+TEST_F(FusionPassTest, ElementwiseFusion) {
+    Graph graph;
+    
+    // Create chain: Add -> Mul -> ReLU
+    Node add_node(NodeType::ADD, "add");
+    add_node.setInputs({"input1", "input2"});
+    add_node.setOutputs({"add_out"});
+    
+    Node mul_node(NodeType::MUL, "mul");
+    mul_node.setInputs({"add_out", "scale"});
+    mul_node.setOutputs({"mul_out"});
+    
+    Node relu_node(NodeType::RELU, "relu");
+    relu_node.setInputs({"mul_out"});
+    relu_node.setOutputs({"output"});
+    
+    graph.addNode(add_node);
+    graph.addNode(mul_node);
+    graph.addNode(relu_node);
+    
+    EXPECT_EQ(graph.getNodeCount(), 3);
+    
+    bool modified = fusion_pass_->fuseElementwiseOps(graph);
+    
+    EXPECT_TRUE(modified);
+    EXPECT_EQ(graph.getNodeCount(), 1);
+    
+    const auto& nodes = graph.getNodes();
+    EXPECT_EQ(nodes[0].getType(), NodeType::FUSED_ELEMENTWISE);
+}
+
+TEST_F(FusionPassTest, NoFusionWhenNotApplicable) {
+    Graph graph;
+    
+    // Create non-fusable pattern: Conv -> Pool -> Conv
+    Node conv1(NodeType::CONV2D, "conv1");
+    conv1.setInputs({"input"});
+    conv1.setOutputs({"conv1_out"});
+    
+    Node pool(NodeType::MAX_POOL, "pool");
+    pool.setInputs({"conv1_out"});
+    pool.setOutputs({"pool_out"});
+    
+    Node conv2(NodeType::CONV2D, "conv2");
+    conv2.setInputs({"pool_out"});
+    conv2.setOutputs({"output"});
+    
+    graph.addNode(conv1);
+    graph.addNode(pool);
+    graph.addNode(conv2);
+    
+    EXPECT_EQ(graph.getNodeCount(), 3);
+    
+    bool modified = fusion_pass_->runOnGraph(graph);
+    
+    EXPECT_FALSE(modified);
+    EXPECT_EQ(graph.getNodeCount(), 3);
+}
+
+---
+
+# ============================================================================
+# File: benchmarks/compilation_speed/benchmark_compile_time.cpp
+# ============================================================================
+#include <benchmark/benchmark.h>
+#include "neuralcompiler/compiler.h"
+#include "neuralcompiler/core/graph.h"
+#include "test_models.h"
+
+using namespace neuralcompiler;
+
+// Benchmark compilation of different model types
+static void BM_CompileResNet50(benchmark::State& state) {
+    auto graph = TestModels::createResNet50();
+    CompilerConfig config;
+    config.optimization_level = OptimizationLevel::O2;
+    config.target_backend = Backend::ACCELERATOR;
+    
+    Compiler compiler(config);
+    
+    for (auto _ : state) {
+        auto compiled_model = compiler.compile(graph);
+        benchmark::DoNotOptimize(compiled_model);
+    }
+    
+    state.SetLabel("ResNet-50");
+    state.SetItemsProcessed(state.iterations());
+}
+
+static void BM_CompileBERTBase(benchmark::State& state) {
+    auto graph = TestModels::createBERTBase();
+    CompilerConfig config;
+    config.optimization_level = OptimizationLevel::O2;
+    config.target_backend = Backend::ACCELERATOR;
+    
+    Compiler compiler(config);
+    
+    for (auto _ : state) {
+        auto compiled_model = compiler.compile(graph);
+        benchmark::DoNotOptimize(compiled_model);
+    }
+    
+    state.SetLabel("BERT-Base");
+    state.SetItemsProcessed(state.iterations());
+}
+
+static void BM_CompileGPT2(benchmark::State& state) {
+    auto graph = TestModels::createGPT2();
+    CompilerConfig config;
+    config.optimization_level = OptimizationLevel::O2;
+    config.target_backend = Backend::ACCELERATOR;
+    
+    Compiler compiler(config);
+    
+    for (auto _ : state) {
+        auto compiled_model = compiler.compile(graph);
+        benchmark::DoNotOptimize(compiled_model);
+    }
+    
+    state.SetLabel("GPT-2");
+    state.SetItemsProcessed(state.iterations());
+}
+
+// Benchmark different optimization levels
+static void BM_OptimizationLevels(benchmark::State& state) {
+    auto graph = TestModels::createResNet50();
+    
+    OptimizationLevel opt_level = static_cast<OptimizationLevel>(state.range(0));
+    CompilerConfig config;
+    config.optimization_level = opt_level;
+    config.target_backend = Backend::ACCELERATOR;
+    
+    Compiler compiler(config);
+    
+    for (auto _ : state) {
+        auto compiled_model = compiler.compile(graph);
+        benchmark::DoNotOptimize(compiled_model);
+    }
+    
+    std::string label = "O" + std::to_string(static_cast<int>(opt_level));
+    state.SetLabel(label);
+}
+
+// Benchmark parallel compilation
+static void BM_ParallelCompilation(benchmark::State& state) {
+    auto graph = TestModels::createLargeModel();
+    
+    CompilerConfig config;
+    config.optimization_level = OptimizationLevel::O2;
+    config.target_backend = Backend::ACCELERATOR;
+    config.num_threads = state.range(0);
+    
+    Compiler compiler(config);
+    
+    for (auto _ : state) {
+        auto compiled_model = compiler.compile(graph);
+        benchmark::DoNotOptimize(compiled_model);
+    }
+    
+    state.SetLabel("threads=" + std::to_string(state.range(0)));
+}
+
+// Register benchmarks
+BENCHMARK(BM_CompileResNet50)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_CompileBERTBase)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_CompileGPT2)->Unit(benchmark::kMillisecond);
+
+BENCHMARK(BM_OptimizationLevels)
+    ->Arg(0)->Arg(1)->Arg(2)->Arg(3)
+    ->Unit(benchmark::kMillisecond);
+
+BENCHMARK(BM_ParallelCompilation)
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)
+    ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_MAIN();
+
+---
+
+# ============================================================================
+# File: docs/architecture.md
+# ============================================================================
+# NeuralCompiler Architecture
+
+## Overview
+
+NeuralCompiler is designed as a multi-layered compiler framework for optimizing machine learning models across different neural network architectures (CNNs, LLMs, LMMs) and target hardware platforms.
+
+## Architecture Layers
+
+### 1. Frontend Layer
+
+The frontend layer is responsible for parsing models from various ML frameworks and converting them into the compiler's intermediate representation (IR).
+
+#### Supported Formats
+- **ONNX**: Industry standard format supporting most frameworks
+- **PyTorch**: Native PyTorch model support via TorchScript
+- **TensorFlow**: SavedModel and frozen graph formats
+
+#### Key Components
+- `ONNXParser`: Converts ONNX models to internal graph representation
+- `PyTorchParser`: Handles TorchScript models
+- `TensorFlowParser`: Processes TensorFlow models
+
+```cpp
+// Example frontend usage
+ONNXParser parser;
+auto graph = parser.parseFromFile("model.onnx");
+```
+
+### 2. Intermediate Representation (IR)
+
+The IR is a graph-based representation that captures the computational structure of neural networks while being amenable to optimization.
+
+#### Core IR Components
+
+**Graph**: Container for the entire computational graph
+- Maintains topological order of operations
+- Tracks data dependencies between nodes
+- Provides graph manipulation utilities
+
+**Node**: Represents individual operations
+- Stores operation type and attributes
+- Manages input/output tensor connections
+- Supports metadata for optimization hints
+
+**Tensor**: Represents data flowing through the graph
+- Shape and data type information
+- Memory layout specifications
+- Quantization parameters
+
+#### IR Design Principles
+- **Immutability**: IR transformations create new graphs for safety
+- **Type Safety**: Strong typing prevents invalid transformations
+- **Extensibility**: Easy to add new operation types
+- **Debuggability**: Rich debugging information preserved
+
+### 3. Optimization Layer
+
+The optimization layer applies various transformation passes to improve performance and reduce resource usage.
+
+#### Optimization Passes
+
+**Graph Fusion Pass**
+- Combines compatible operations into fused kernels
+- Reduces memory bandwidth and kernel launch overhead
+- Supports both CNN-specific and transformer-specific patterns
+
+```cpp
+// Conv + BatchNorm + ReLU → FusedConvBnReLU
+bool fuseConvBatchNormReLU(Graph& graph);
+
+// Multi-head attention fusion
+bool fuseMultiHeadAttention(Graph& graph);
+```
+
+**Memory Optimization Pass**
+- Analyzes memory access patterns
+- Implements memory pooling and reuse
+- Optimizes tensor layouts for target hardware
+
+**Quantization Pass**
+- Applies various quantization schemes (INT8, INT16, mixed-precision)
+- Uses calibration data to maintain accuracy
+- Generates quantized kernels
+
+**Scheduler Pass**
+- Optimizes operation execution order
+- Implements parallelization strategies
+- Balances compute and memory constraints
+
+#### Pass Manager
+The pass manager orchestrates the application of optimization passes based on the target optimization level and hardware constraints.
+
+### 4. Backend Layer
+
+The backend layer generates optimized code for specific target architectures.
+
+#### Supported Backends
+
+**Custom Accelerator Backend**
+- Generates code for SiMa.ai's ML accelerator architecture
+- Leverages hardware-specific features for maximum performance
+- Implements custom memory hierarchy optimizations
+
+**CUDA Backend**
+- Targets NVIDIA GPUs
+- Uses cuDNN and cuBLAS libraries where appropriate
+- Supports Tensor Core operations for newer architectures
+
+**CPU Backend**
+- Optimized for x86 and ARM processors
+- Uses SIMD instructions and multi-threading
+- Integrates with optimized BLAS libraries
+
+#### Code Generation Process
+1. **IR Analysis**: Analyze the optimized graph structure
+2. **Kernel Selection**: Choose optimal kernels for each operation
+3. **Memory Planning**: Allocate and schedule memory usage
+4. **Code Emission**: Generate the final executable code
+
+## Data Flow
+
+```
+Input Model → Frontend → IR → Optimization Passes → Backend → Optimized Code
+     ↓           ↓        ↓            ↓              ↓           ↓
+   ONNX/       Graph   Graph       Optimized      Target      Executable
+  PyTorch     Creation Analysis      Graph       Codegen        Code
+```
+
+## Key Design Decisions
+
+### Graph Representation
+We chose a directed acyclic graph (DAG) representation because:
+- Natural fit for neural network computation flow
+- Enables sophisticated optimization algorithms
+- Supports parallel compilation of independent subgraphs
+
+### Pass-Based Optimization
+The pass-based architecture provides:
+- **Modularity**: Each optimization is isolated and testable
+- **Flexibility**: Easy to add new optimizations or reorder existing ones
+- **Debuggability**: Individual passes can be enabled/disabled for debugging
+
+### Multi-Backend Support
+Supporting multiple backends allows:
+- **Hardware Flexibility**: Same model can target different architectures
+- **Performance Comparison**: Easy to benchmark across different targets
+- **Future Extensibility**: New hardware support can be added incrementally
+
+## Performance Characteristics
+
+### Compilation Speed
+- **Parallel Passes**: Independent optimizations run in parallel
+- **Incremental Compilation**: Only recompile changed parts of the graph
+- **Pass Scheduling**: Critical passes run first to maximize benefit
+
+### Runtime Performance
+- **Aggressive Fusion**: Reduces kernel launch overhead
+- **Memory Optimization**: Minimizes data movement
+- **Hardware-Specific Tuning**: Leverages target architecture features
+
+## Extensibility Points
+
+### Adding New Operations
+1. Define operation in IR (`NodeType` enum)
+2. Implement parsing in relevant frontends
+3. Add optimization patterns if applicable
+4. Implement code generation in backends
+
+### Adding New Optimization Passes
+1. Inherit from `OptimizationPass` base class
+2. Implement `runOnGraph()` method
+3. Register pass with the pass manager
+4. Add configuration options if needed
+
+### Adding New Backends
+1. Inherit from `CodegenBackend` base class
+2. Implement code generation for all supported operations
+3. Add backend-specific optimizations
+4. Integrate with build system
+
+## Testing Strategy
+
+### Unit Tests
+- Individual component testing (Graph, Node, Tensor)
+- Optimization pass correctness
+- Backend code generation validation
+
+### Integration Tests
+- End-to-end compilation pipelines
+- Cross-backend result consistency
+- Performance regression detection
+
+### Benchmarking
+- Compilation speed measurements
+- Runtime performance comparison
+- Memory usage analysis
+
+---
+
+# ============================================================================
+# File: LICENSE
+# ============================================================================
+MIT License
+
+Copyright (c) 2025 NeuralCompiler Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+# ============================================================================
+# File: .clang-format
+# ============================================================================
+---
+Language: Cpp
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 100
+UseTab: Never
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakTemplateDeclarations: true
+BreakConstructorInitializers: BeforeColon
+ConstructorInitializerIndentWidth: 4
+ContinuationIndentWidth: 4
+Cpp11BracedListStyle: true
+IndentCaseLabels: true
+NamespaceIndentation: None
+SortIncludes: true
+SortUsingDeclarations: true
+SpaceAfterCStyleCast: false
+SpaceAfterTemplateKeyword: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: false
+SpacesInAngles: false
+SpacesInCStyleCastParentheses: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+---
+
+# ============================================================================
+# File: .gitignore
+# ============================================================================
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# IDE files
+.vscode/
+.idea/
+*.sln
+*.vcxproj*
+*.user
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+
+# Testing
+Testing/
+*.gcov
+*.gcda
+*.gcno
+coverage.info
+coverage/
+
+# Generated files
+*.pb.h
+*.pb.cc
+compile_commands.json
+
+# Temporary files
+*.tmp
+*.temp
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Profiling
+*.prof
+perf.data*
+
+# Package managers
+vcpkg_installed/
+conan.lock
+conanbuild.txt
+conanrun.txt
+
+# Documentation build
+docs/_build/
+docs/html/
+docs/latex/
+
+# Model files (too large for git)
+*.onnx
+*.pb
+*.pth
+*.h5
+*.tflite
