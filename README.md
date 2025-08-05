@@ -359,8 +359,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Contact
 
-- **Author**: [Your Name](mailto:your.email@example.com)
-- **Project Link**: [https://github.com/username/neuralcompiler](https://github.com/username/neuralcompiler)
+- **Author**: [Soutrik Mukherjee](mailto:soutrik.viratech@gmail.com)
+- **Project Link**: [https://github.com/username/neuralcompiler](https://github.com/SoutrikMukherjee/neuralcompiler)
 - **Issues**: [GitHub Issues](https://github.com/username/neuralcompiler/issues)
 
 ---
