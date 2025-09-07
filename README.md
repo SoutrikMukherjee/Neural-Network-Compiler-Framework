@@ -1,6 +1,6 @@
 # NeuralCompiler: High-Performance ML Model Compiler Framework
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/username/neuralcompiler)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/SoutrikMukherjee/neuralcompiler)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![C++](https://img.shields.io/badge/C%2B%2B-17-blue)](https://en.cppreference.com/w/cpp/17)
 
@@ -108,7 +108,7 @@ neuralcompiler/
 ### Build Instructions
 
 ```bash
-git clone https://github.com/username/neuralcompiler.git
+git clone https://github.com/SoutrikMukherjee/neuralcompiler.git
 cd neuralcompiler
 
 # Create build directory
@@ -360,8 +360,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 📞 Contact
 
 - **Author**: [Soutrik Mukherjee](mailto:soutrik.viratech@gmail.com)
-- **Project Link**: [https://github.com/username/neuralcompiler](https://github.com/SoutrikMukherjee/neuralcompiler)
-- **Issues**: [GitHub Issues](https://github.com/username/neuralcompiler/issues)
+- **Project Link**: [https://github.com/SoutrikMukherjee/neuralcompiler](https://github.com/SoutrikMukherjee/neuralcompiler)
+- **Issues**: [GitHub Issues](https://github.com/SoutrikMukherjee/neuralcompiler/issues)
 
 ---
 
